@@ -334,6 +334,8 @@ std::optional<Luau::ModuleInfo> WorkspaceFileResolver::resolveModule(const Luau:
             }
 
             return Luau::ModuleInfo{mapContext(context->name) + '/' + i->index.value, context->optional};
+        } else if (strcmp(i->index.value, "Packages") == 0) {
+            return Luau::ModuleInfo{"game/ReplicatedStorage/Packages"};
         }
     }
     else if (auto* i_expr = node->as<Luau::AstExprIndexExpr>())

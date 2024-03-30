@@ -49,7 +49,6 @@ Luau::ToStringResult toStringReturnTypeDetailed(Luau::TypePackId retTypes, Luau:
 std::optional<Luau::AstExpr*> matchRequire(const Luau::AstExprCall& call);
 
 } // namespace types
-
 // TODO: should upstream this
 Luau::AstNode* findNodeOrTypeAtPosition(const Luau::SourceModule& source, Luau::Position pos);
 Luau::AstNode* findNodeOrTypeAtPositionClosed(const Luau::SourceModule& source, Luau::Position pos);

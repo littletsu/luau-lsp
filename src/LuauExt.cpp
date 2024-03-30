@@ -156,7 +156,6 @@ Luau::TypeId getSourcemapType(const Luau::GlobalTypes& globals, Luau::TypeArena&
                             auto str = expr.args.data[0]->as<Luau::AstExprConstantString>();
                             if (!str)
                                 return std::nullopt;
-
                             if (auto child = node->findChild(std::string(str->value.data, str->value.size)))
                                 return Luau::WithPredicate<Luau::TypePackId>{arena.addTypePack({getSourcemapType(globals, arena, *child)})};
 
@@ -355,6 +354,23 @@ void registerInstanceTypes(Luau::Frontend& frontend, const Luau::GlobalTypes& gl
             if (auto serviceType = globals.globalScope->lookupType(serviceName))
                 addChildrenToCTV(globals, arena, serviceType->type, service);
         }
+        if (auto knitType = globals.globalScope->lookupType("Knit"))
+        {
+
+            if (auto* ttv = Luau::getMutable<Luau::TableType>(knitType->type))
+            {
+                if (auto rsType = globals.globalScope->lookupType("ReplicatedStorage"))
+                {
+                    if (auto rsv = Luau::get<Luau::ClassType>(rsType->type))
+                    {
+                        if (auto pkgs = rsv->props.find("Packages"); pkgs != rsv->props.end())
+                        {
+                            ttv->props["Packages"] = Luau::makeProperty(pkgs->second.type());
+                        }
+                    }
+                }
+            }
+        }
 
         // Add containers to player and copy over instances
         // TODO: Player.Character should contain StarterCharacter instances
@@ -416,10 +432,25 @@ void registerInstanceTypes(Luau::Frontend& frontend, const Luau::GlobalTypes& gl
             scope->bindings[Luau::AstName("game")] = Luau::Binding{globals.builtinTypes->anyType};
         }
 
+
         if (expressiveTypes || forAutocomplete)
             if (auto node =
                     fileResolver.isVirtualPath(name) ? fileResolver.getSourceNodeFromVirtualPath(name) : fileResolver.getSourceNodeFromRealPath(name))
+            {
                 scope->bindings[Luau::AstName("script")] = Luau::Binding{getSourcemapType(globals, arena, node.value())};
+                if (node.value()->sourceCodeType() == Luau::SourceCode::Type::Local)
+                {
+                    scope->exportedTypeBindings["MeowieCleint"] = Luau::TypeFun{scope->lookupType("string").value().type};
+                }
+                if (node.value()->sourceCodeType() == Luau::SourceCode::Type::Script)
+                {
+                    scope->exportedTypeBindings["MeowieServer"] = Luau::TypeFun{scope->lookupType("string").value().type};
+                }
+                if (node.value()->sourceCodeType() == Luau::SourceCode::Type::Module)
+                {
+                    scope->exportedTypeBindings["MeowieModule"] = Luau::TypeFun{scope->lookupType("string").value().type};
+                }
+            }
     };
 }
 
@@ -492,6 +523,58 @@ std::optional<DefinitionsFileMetadata> parseDefinitionsFileMetadata(const std::s
     return std::nullopt;
 }
 
+
+static bool checkRequirePath(Luau::TypeChecker& typechecker, Luau::AstExpr* expr)
+{
+    // require(foo.parent.bar) will technically work, but it depends on legacy goop that
+    // Luau does not and could not support without a bunch of work.  It's deprecated anyway, so
+    // we'll warn here if we see it.
+    bool good = true;
+    Luau::AstExprIndexName* indexExpr = expr->as<Luau::AstExprIndexName>();
+
+    while (indexExpr)
+    {
+        if (indexExpr->index == "parent")
+        {
+            typechecker.reportError(indexExpr->indexLocation, Luau::DeprecatedApiUsed{"parent", "Parent"});
+            good = false;
+        }
+
+        indexExpr = indexExpr->expr->as<Luau::AstExprIndexName>();
+    }
+
+    return good;
+}
+
+static std::optional<Luau::WithPredicate<Luau::TypePackId>> magicFunctionRequire(
+    Luau::TypeChecker& typechecker, const Luau::ScopePtr& scope, const Luau::AstExprCall& expr, Luau::WithPredicate<Luau::TypePackId> withPredicate)
+{
+    Luau::TypeArena& arena = typechecker.currentModule->internalTypes;
+
+    if (expr.args.size != 1)
+    {
+        typechecker.reportError(Luau::TypeError{expr.location, Luau::GenericError{"nah jit tripping"}});
+        return std::nullopt;
+    }
+
+    if (!checkRequirePath(typechecker, expr.args.data[0]))
+        return std::nullopt;
+
+    if (auto moduleInfo = typechecker.resolver->resolveModuleInfo(typechecker.currentModule->name, expr))
+    {
+        if (endsWith(moduleInfo->name, "Knit"))
+        {
+            auto knitType = scope->lookupType("Knit");
+            if (knitType)
+            {
+                return Luau::WithPredicate<Luau::TypePackId>{arena.addTypePack({knitType->type})};
+            }
+        }
+        return Luau::WithPredicate<Luau::TypePackId>{arena.addTypePack({typechecker.checkRequire(scope, *moduleInfo, expr.location)})};
+    }
+    return std::nullopt;
+}
+
 Luau::LoadDefinitionFileResult registerDefinitions(Luau::Frontend& frontend, Luau::GlobalTypes& globals, const std::string& definitions,
     bool typeCheckForAutocomplete, std::optional<DefinitionsFileMetadata> metadata)
 {
@@ -500,6 +583,62 @@ Luau::LoadDefinitionFileResult registerDefinitions(Luau::Frontend& frontend, Lua
         frontend.loadDefinitionFile(globals, globals.globalScope, definitions, "@roblox", /* captureComments = */ false, typeCheckForAutocomplete);
     if (!loadResult.success)
         return loadResult;
+    
+    auto csTT = Luau::TableType{Luau::TableState::Generic, globals.globalScope->level};
+    auto csT = globals.globalTypes.addType(csTT);
+    auto createService = Luau::makeFunction(globals.globalTypes, std::nullopt, {csT}, {csT});
+    
+    Luau::attachMagicFunction(createService,
+        [&globals](Luau::TypeChecker& typeChecker, const Luau::ScopePtr& scope, const Luau::AstExprCall& expr,
+            const Luau::WithPredicate<Luau::TypePackId>& withPredicate) -> std::optional<Luau::WithPredicate<Luau::TypePackId>>
+        {
+            if (auto call = expr.as<Luau::AstExprCall>()) {
+                if (call->args.size < 1) {
+                    return std::nullopt;
+                }
+                auto arg1 = call->args.data[0];
+                if (auto serviceTable = arg1->as<Luau::AstExprTable>()) {
+                    for (auto it = serviceTable->items.rbegin(), e = serviceTable->items.rend(); it != e; ++it) {
+                        auto item = (*it);
+                        auto key = item.key;
+                        if (!key)
+                            continue;
+                        if (auto name = key->as<Luau::AstExprConstantString>()) {
+                            if (strcmp(name->value.data, "Name") != 0) continue;
+                            if(auto value = item.value->as<Luau::AstExprConstantString>()) {
+                                auto sti = Luau::TableIndexer{globals.builtinTypes->stringType, globals.builtinTypes->anyType};
+                                auto stt = Luau::TableType{{}, sti, globals.globalScope->level, Luau::TableState::Unsealed};
+
+                                auto stid = globals.globalTypes.addType(stt);
+                                
+                                globals.globalScope->exportedTypeBindings[value->value.data] = Luau::TypeFun{stid};
+                                return Luau::WithPredicate<Luau::TypePackId>{globals.globalTypes.addTypePack({stid})};
+                            } else {
+                                typeChecker.reportError(Luau::TypeError{item.value->location, Luau::GenericError{"Unsupported value type for CreateService Name"}});
+                            }
+                        } 
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+    );
+    
+    Luau::TableType::Props props{{"CreateService", {createService}}};
+
+    Luau::TableType tab{
+        props, 
+        Luau::TableIndexer{
+            globals.builtinTypes->stringType, 
+            globals.builtinTypes->anyType
+        }, 
+        globals.globalScope->level,
+        Luau::TableState::Sealed
+    };
+    
+    globals.globalScope->exportedTypeBindings["Knit"] = Luau::TypeFun{globals.globalTypes.addType(tab)};
+    
+    Luau::attachMagicFunction(Luau::getGlobalBinding(globals, "require"), magicFunctionRequire);
 
     // HACK: Mark "debug" using `@luau` symbol instead
     if (auto it = globals.globalScope->bindings.find(Luau::AstName("debug")); it != globals.globalScope->bindings.end())
